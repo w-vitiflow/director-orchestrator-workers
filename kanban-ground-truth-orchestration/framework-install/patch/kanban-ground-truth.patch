@@ -1,0 +1,815 @@
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a08cb8f..af3eff8 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -74,6 +74,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+         "started_at": t.started_at,
+         "completed_at": t.completed_at,
+         "result": t.result,
++        "acceptance": (
++            json.loads(t.acceptance) if t.acceptance else None
++        ),
+         "skills": list(t.skills) if t.skills else [],
+         "max_retries": t.max_retries,
+         "model_override": t.model_override,
+@@ -133,6 +136,53 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
+     return branch
+ 
+ 
++# Sentinel distinguishing "no acceptance supplied" (None) from "supplied but
++# invalid JSON" (this sentinel) so `_cmd_create` can exit 2 on a parse error.
++_ACCEPTANCE_PARSE_ERROR = object()
++
++
++def _parse_acceptance(args: argparse.Namespace) -> Optional[dict]:
++    """Resolve the ground-truth acceptance criteria for ``kanban create``.
++
++    Precedence: ``--acceptance-file`` > ``--acceptance`` > None. Returns a
++    dict (validated to contain at least ``intent``) or ``None`` when neither
++    flag is given. On invalid input returns ``_ACCEPTANCE_PARSE_ERROR`` so the
++    caller can exit non-zero (it carries its own structured message for stderr
++    via ``print`` inside).
++    """
++    raw = getattr(args, "acceptance", None)
++    file = getattr(args, "acceptance_file", None)
++    source = "--acceptance"
++    if file:
++        source = "--acceptance-file " + file
++        try:
++            with open(file, "r", encoding="utf-8") as fh:
++                raw = fh.read()
++        except OSError as exc:
++            print(f"kanban: {source}: {exc}", file=sys.stderr)
++            return _ACCEPTANCE_PARSE_ERROR
++    if not raw or not str(raw).strip():
++        return None
++    try:
++        data = json.loads(raw)
++    except (ValueError, TypeError) as exc:
++        print(
++            f"kanban: {source}: invalid JSON: {exc}",
++            file=sys.stderr,
++        )
++        return _ACCEPTANCE_PARSE_ERROR
++    if not isinstance(data, dict) or not data.get("intent"):
++        print(
++            f"kanban: {source}: acceptance must be a JSON object with a "
++            'non-empty "intent" (e.g. {"intent":"...","checks":[...]})',
++            file=sys.stderr,
++        )
++        return _ACCEPTANCE_PARSE_ERROR
++    if data.get("source") is None:
++        data["source"] = "director"
++    return data
++
++
+ def _check_dispatcher_presence(
+     hermes_home: Optional[Path] = None,
+ ) -> tuple[bool, str]:
+@@ -349,6 +399,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+     p_create.add_argument("--idempotency-key", default=None,
+                           help="Dedup key. If a non-archived task with this key exists, "
+                                "its id is returned instead of creating a duplicate.")
++    p_create.add_argument("--acceptance", default=None, metavar="JSON",
++                          help="Ground-truth acceptance criteria as JSON, e.g. "
++                               "'{\"intent\":\"original goal\",\"checks\":[\"...\"]}'. "
++                               "Stored verbatim and automatically propagated to child "
++                               "tasks so intent never degrades across orchestration "
++                               "hops (Director->orchestrator->worker->verifier).")
++    p_create.add_argument("--acceptance-file", default=None, metavar="PATH",
++                          help="Read --acceptance criteria from a file (overrides --acceptance).")
+     p_create.add_argument("--max-runtime", default=None,
+                           help="Per-task runtime cap. Accepts seconds (300) or "
+                                "durations (90s, 30m, 2h, 1d). When exceeded, "
+@@ -420,6 +478,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
+     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
++    p_swarm.add_argument("--acceptance", default=None, metavar="JSON",
++                         help="Ground-truth acceptance criteria (JSON) applied to the "
++                              "root; every worker/verifier/synthesizer inherits it "
++                              "VERBATIM so intent never degrades across the swarm fan-out.")
++    p_swarm.add_argument("--acceptance-file", default=None, metavar="PATH",
++                         help="Read --acceptance from a file (overrides --acceptance).")
+     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
+ 
+     # --- list ---
+@@ -922,6 +986,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
+         help="Emit one JSON object per task on stdout",
+     )
+ 
++    # --- route-assess ---
++    p_route = sub.add_parser(
++        "route-assess",
++        help="Cheap-inline tripwire: should the Director run this inline "
++             "or dispatch it to a card?",
++        description=(
++            "Given structured signals about an upcoming piece of work, return "
++            "'inline' or 'dispatch' plus the reasons. This is the mechanical "
++            "anti-vibe rule that keeps cheap work from paying orchestrator "
++            "overhead while preventing expensive/parallel/isolated work from "
++            "being run inline. Advisory: it never blocks, but ignoring it is "
++            "a deliberate, recorded choice."
++        ),
++    )
++    p_route.add_argument("--effort-minutes", type=int, default=None,
++                         help="Estimated inline effort in minutes (dispatch if > %(default)s)")
++    p_route.add_argument("--parallel-splits", type=int, default=None,
++                         help="Number of independent parallel streams (dispatch if > 1)")
++    p_route.add_argument("--external-slow", dest="external_slow",
++                         action="store_true", default=False,
++                         help="Depends on a long-running/external resource (GPU render, download, slow API)")
++    p_route.add_argument("--needs-verification", dest="needs_verification",
++                         action="store_true", default=False,
++                         help="Requires an independent review/verification step")
++    p_route.add_argument("--requires-isolation", dest="requires_isolation",
++                         action="store_true", default=False,
++                         help="Must run in a specific worktree/tenant/profile/board")
++    p_route.add_argument("--needs-durability", dest="needs_durability",
++                         action="store_true", default=False,
++                         help="Needs durable persistence/survive a crash/be audited")
++    p_route.add_argument("--json", action="store_true",
++                         help="Emit the verdict as JSON")
++
+     # --- gc ---
+     p_gc = sub.add_parser(
+         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+@@ -1083,6 +1180,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+             "context":  _cmd_context,
+             "specify":  _cmd_specify,
+             "decompose":  _cmd_decompose,
++            "route-assess": _cmd_route_assess,
+             "gc":       _cmd_gc,
+         }
+         handler = handlers.get(action)
+@@ -1495,6 +1593,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             file=sys.stderr,
+         )
+         return 2
++    acceptance = _parse_acceptance(args)
++    if acceptance is _ACCEPTANCE_PARSE_ERROR:
++        return 2
+     with kb.connect_closing() as conn:
+         task_id = kb.create_task(
+             conn,
+@@ -1519,6 +1620,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             goal_mode=bool(getattr(args, "goal_mode", False)),
+             goal_max_turns=getattr(args, "goal_max_turns", None),
+             initial_status=getattr(args, "initial_status", "running"),
++            acceptance=acceptance,
+         )
+         task = kb.get_task(conn, task_id)
+     if getattr(args, "json", False):
+@@ -1549,6 +1651,9 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
+     if not workers:
+         print("kanban swarm: at least one --worker is required", file=sys.stderr)
+         return 2
++    acceptance = _parse_acceptance(args)
++    if acceptance is _ACCEPTANCE_PARSE_ERROR:
++        return 2
+     with kb.connect_closing() as conn:
+         created = ks.create_swarm(
+             conn,
+@@ -1560,6 +1665,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
+             created_by=args.created_by or _profile_author(),
+             priority=args.priority,
+             idempotency_key=getattr(args, "idempotency_key", None),
++            acceptance=acceptance,
+         )
+     if getattr(args, "json", False):
+         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
+@@ -3019,6 +3125,46 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+     return 0 if (ok_count > 0 or not ids) else 1
+ 
+ 
++def _cmd_route_assess(args: argparse.Namespace) -> int:
++    """Cheap-inline tripwire: print the routing verdict for the given signals.
++
++    Exits 0 in either case (the verdict is the output, not an error state);
++    the caller acts on it. With ``--json`` prints a single structured object.
++    """
++    try:
++        from hermes_cli import kanban_route as _kr
++    except Exception as exc:  # pragma: no cover - import only fails if module missing
++        print(f"kanban: route-assess unavailable: {exc}", file=sys.stderr)
++        return 2
++    signals = _kr.RoutingSignals(
++        effort_minutes=args.effort_minutes,
++        parallel_splits=args.parallel_splits,
++        external_or_slow_dependency=bool(args.external_slow),
++        needs_verification=bool(args.needs_verification),
++        requires_isolation=bool(args.requires_isolation),
++        needs_durability=bool(args.needs_durability),
++    )
++    verdict = _kr.assess_routing(signals)
++    if getattr(args, "json", False):
++        print(json.dumps(verdict.as_dict(), indent=2, ensure_ascii=False))
++        return 0
++    human = {
++        _kr.T_INLINE_OK: "No tripwire hit — run this inline; orchestration would be pure overhead.",
++        _kr.R_PARALLEL: "Decomposes into >1 independent stream — fan-out is the point, dispatch.",
++        _kr.R_EXTERNAL: "External or slow dependency (GPU/render/download/API) — don't hold it inline.",
++        _kr.R_VERIFY: "Needs an independent review/verification — dispatch with a verifier.",
++        _kr.R_ISOLATION: "Requires an isolated worktree/tenant/profile/board — dispatch.",
++        _kr.R_DURABILITY: "Needs durable persistence/audit trail — dispatch to a card.",
++        _kr.R_EFFORT: f"Estimated effort exceeds the {_kr.DEFAULT_INLINE_EFFORT_MINUTES}min inline budget — dispatch.",
++    }
++    print(f"route-assess: {verdict.mode.upper()}")
++    for r in verdict.reasons:
++        print(f"  - {human.get(r, r)}")
++    print("")
++    print("Advisory (never blocks): ignoring this verdict is a deliberate, recorded choice.")
++    return 0
++
++
+ def _cmd_gc(args: argparse.Namespace) -> int:
+     """Remove scratch workspaces of archived tasks, prune old events, and
+     delete old worker logs."""
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 113e348..ad62657 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -924,6 +924,10 @@ class Task:
+     project_id: Optional[str] = None
+     result: Optional[str] = None
+     idempotency_key: Optional[str] = None
++    # Immutable ground-truth acceptance criteria (JSON string). See the column
++    # comment in SCHEMA_SQL. Carried verbatim across orchestration hops so a
++    # worker/verifier checks the ORIGINAL intent, never a rewritten summary.
++    acceptance: Optional[str] = None
+     # Unified non-success counter. Incremented on any of:
+     #   * spawn failure (dispatcher couldn't launch the worker)
+     #   * timed_out outcome (worker exceeded max_runtime_seconds)
+@@ -1026,6 +1030,7 @@ class Task:
+             tenant=row["tenant"] if "tenant" in keys else None,
+             result=row["result"] if "result" in keys else None,
+             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
++            acceptance=row["acceptance"] if "acceptance" in keys else None,
+             consecutive_failures=(
+                 row["consecutive_failures"] if "consecutive_failures" in keys
+                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
+@@ -1205,6 +1210,15 @@ CREATE TABLE IF NOT EXISTS tasks (
+     tenant               TEXT,
+     result               TEXT,
+     idempotency_key      TEXT,
++    -- Ground-truth acceptance criteria carried FORWARD across every orchestration
++    -- hop (Director -> orchestrator -> worker -> verifier). JSON: {"intent":
++    -- <verbatim original goal>, "checks": [<machine-checkable acceptance
++    -- criteria>], "source": <task id or 'director' that authored it>}. Unlike
++    -- `body` (which orchestrators are free to rewrite), `acceptance` is the
++    -- immutable ground truth a worker must satisfy and a verifier must check.
++    -- Propagated automatically to child tasks so intent is never re-summarized
++    -- into drift.
++    acceptance           TEXT,
+     -- Unified consecutive-failure counter. Incremented on spawn
+     -- failure, timeout, or crash; reset only on successful completion.
+     -- The circuit breaker in _record_task_failure trips when this
+@@ -2341,6 +2355,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+         _add_column_if_missing(
+             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
+         )
++    if "acceptance" not in cols:
++        _add_column_if_missing(
++            conn, "tasks", "acceptance", "acceptance TEXT"
++        )
+     # ``idx_tasks_idempotency`` is created unconditionally below alongside
+     # the other additive-column indexes — see the block after the
+     # legacy-column migration. Creating it here too would be redundant.
+@@ -2906,6 +2924,7 @@ def create_task(
+     board: Optional[str] = None,
+     project_id: Optional[str] = None,
+     project_source_task_id: Optional[str] = None,
++    acceptance: Optional[dict] = None,
+ ) -> str:
+     """Create a new task and optionally link it under parent tasks.
+ 
+@@ -3208,6 +3227,29 @@ def create_task(
+                         except Exception:
+                             branch_name = None
+ 
++                # Ground-truth propagation: a child task that does not supply its
++                # own acceptance inherits its single parent's acceptance VERBATIM.
++                # This is the mechanism that stops intent from degrading across
++                # orchestration hops (Director -> orchestrator -> worker). An
++                # orchestrator is free to rewrite `body`, but `acceptance` is the
++                # immutable ground truth carried forward, so a worker checks the
++                # ORIGINAL criteria, never a rewritten summary. When multiple
++                # parents disagree, we keep the first non-empty acceptance and let
++                # the calling orchestrator reconcile (it can pass one explicitly).
++                if acceptance is None and parents:
++                    _pa = conn.execute(
++                        "SELECT acceptance FROM tasks WHERE id IN ("
++                        + ",".join(["?"] * len(parents)) + ")"
++                        " AND acceptance IS NOT NULL AND acceptance != ''",
++                        parents,
++                    ).fetchall()
++                    for _row in _pa:
++                        if _row["acceptance"]:
++                            acceptance = json.loads(_row["acceptance"])
++                            if acceptance.get("source") is None:
++                                acceptance["source"] = parents[0]
++                            break
++
+                 conn.execute(
+                     """
+                     INSERT INTO tasks (
+@@ -3217,8 +3259,8 @@ def create_task(
+                         max_runtime_seconds,
+                         skills, max_retries, model_override, provider_override,
+                         reasoning_effort,
+-                        goal_mode, goal_max_turns, session_id
+-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                        goal_mode, goal_max_turns, session_id, acceptance
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+                         task_id,
+@@ -3244,6 +3286,7 @@ def create_task(
+                         1 if goal_mode else 0,
+                         int(goal_max_turns) if goal_max_turns is not None else None,
+                         session_id,
++                        json.dumps(acceptance) if acceptance is not None else None,
+                     ),
+                 )
+                 for pid in parents:
+@@ -9239,6 +9282,25 @@ def run_daemon(
+ # Worker context builder (what a spawned worker sees)
+ # ---------------------------------------------------------------------------
+ 
++def _load_task_acceptance(raw: Optional[str]) -> Optional[dict]:
++    """Parse a task's stored acceptance JSON into a dict, or None.
++
++    Never raises: malformed JSON degrades to None (the caller falls back to
++    treating the card as having no ground truth rather than crashing the whole
++    worker-context build). The intent field must be non-empty for the result
++    to be considered ground truth.
++    """
++    if not raw:
++        return None
++    try:
++        data = json.loads(raw)
++    except (ValueError, TypeError):
++        return None
++    if not isinstance(data, dict) or not data.get("intent"):
++        return None
++    return data
++
++
+ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     """Return the full text a worker should read to understand its task.
+ 
+@@ -9306,6 +9368,31 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+         lines.append("")
+ 
++    # GROUND TRUTH: acceptance criteria, rendered VERBATIM (never
++    # summarized/capped like body). This is the immutable intent the Director
++    # (or a parent orchestrator) set, carried forward across every hop so the
++    # worker checks the ORIGINAL criteria, not a rewritten summary. If it's
++    # present, treat it as the authoritative definition of done; verify each
++    # check and report pass/fail against it. See the kanban `create
++    # --acceptance` flag and task.acceptance.
++    acceptance = _load_task_acceptance(task.acceptance)
++    if acceptance:
++        lines.append("## Acceptance criteria (GROUND TRUTH — must verify, do not paraphrase)")
++        intent = acceptance.get("intent") or ""
++        checks = acceptance.get("checks") or []
++        src = acceptance.get("source") or "(unknown)"
++        lines.append(f"- Source: {src}")
++        lines.append(f"- Intent (verbatim): {intent}")
++        if checks:
++            lines.append("- Verify EACH of the following and report pass/fail per item:")
++            for i, c in enumerate(checks, 1):
++                lines.append(f"    {i}. {c}")
++        lines.append(
++            "- On completion, explicitly state which checks passed and which failed "
++            "against THIS acceptance criteria (not a self-summary)."
++        )
++        lines.append("")
++
+     # Attachments — files uploaded to this task (PDFs, source docs,
+     # images). Surface the absolute on-disk path so the worker, which has
+     # full file-tool access, can read them directly (read_file, terminal
+diff --git a/hermes_cli/kanban_route.py b/hermes_cli/kanban_route.py
+new file mode 100644
+index 0000000..899c9e6
+--- /dev/null
++++ b/hermes_cli/kanban_route.py
+@@ -0,0 +1,146 @@
++"""Cheap-inline routing for the kanban Director.
++
++A Director should NOT silently decide "this is small enough, do it inline" on a
++whim — that is exactly the kind of undocumented judgment that later looks like
++an inconsistency. This module makes that decision explicit, mechanical, and
++testable: given structured signals about an upcoming piece of work, it returns
++a verdict of ``inline`` (do it here, skip the orchestrator/worker ceremony) or
++``dispatch`` (create a card and let the pipeline run it), with a human-readable
++list of *why*.
++
++Design intent
++-------------
++The orchestrator->worker ceremony exists to buy parallelism, isolation, and
++durable handoff. Each of those has a cost (dispatch latency, a fresh context,
++a second summary hop, a review gate). The tripwires below invert the question:
++"what would make the ceremony WORTH its cost?" If none of the tripwires is
++hit, the work is cheap to do inline and the ceremony is pure overhead. The
++converse is also true and equally important: whenever any tripwire IS hit, the
++Director must dispatch rather than run inline — running a parallelizable,
++long-running, or externally-dependent job inline is how the pipeline's benefits
++are thrown away.
++
++The verdict is advisory + auditable: it never blocks the caller, but a caller
++that ignores it is making a deliberate, recorded choice to override the rule.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Optional
++
++# Magic-free, conservative constants so the rule is legible and tunable.
++# A job whose *estimated* effort is at or below this is candidate-inline.
++DEFAULT_INLINE_EFFORT_MINUTES = 5
++# If the job naturally splits into more than this many parallel streams, the
++# orchestration fan-out is the whole point -> dispatch.
++DEFAULT_PARALLEL_SPLIT_TRIPWIRE = 1
++
++
++@dataclass
++class RoutingSignals:
++    """Structured, Director-supplied facts about a piece of work.
++
++    All fields are optional and default to ``None`` = "unknown / assume the
++    conservative (dispatch) answer where it matters." The evaluator biases
++    toward dispatch on unknown because dispatching a small job wastes a little
++    money, but running a big job inline wastes a lot and blocks the Director.
++    """
++
++    # Estimated wall-clock effort if run inline (minutes).
++    effort_minutes: Optional[int] = None
++    # Does the work decompose into independent parallel units?
++    # (e.g. render 3 clips on 2 nodes, translate into 4 languages).
++    parallel_splits: Optional[int] = None
++    # Does it depend on a long-running or external resource the Director
++    # shouldn't hold open / wait on (GPU render, model download, remote API
++    # with slow latency, a build that takes minutes)?
++    external_or_slow_dependency: Optional[bool] = None
++    # Does it need a second, independent pair of eyes (verification/review)?
++    needs_verification: Optional[bool] = None
++    # Would it be harmful/impossible to do from the current session (e.g.
++    # it must run in a specific repo worktree/tenant/profile/board)?
++    requires_isolation: Optional[bool] = None
++    # Does it need durable persistence beyond this session (survive a
++    # crash / be audited / be re-run later)?
++    needs_durability: Optional[bool] = None
++
++
++@dataclass
++class RoutingVerdict:
++    mode: str  # 'inline' | 'dispatch'
++    reasons: list = field(default_factory=list)
++    signals: Optional[dict] = None
++
++    def as_dict(self) -> dict:
++        return {
++            "mode": self.mode,
++            "reasons": list(self.reasons),
++            "signals": self.signals or {},
++        }
++
++
++# Named tripwire labels (stable identifiers, not prose) so callers/tests can
++# match on them without fragile string equality.
++T_INLINE_OK = "inline.no_tripwire_hit"
++R_PARALLEL = "dispatch.parallel_split_gt_one"
++R_EXTERNAL = "dispatch.external_or_slow_dependency"
++R_VERIFY = "dispatch.needs_verification"
++R_ISOLATION = "dispatch.requires_isolation"
++R_DURABILITY = "dispatch.needs_durability"
++R_EFFORT = "dispatch.effort_exceeds_inline_budget"
++
++
++def assess_routing(signals: RoutingSignals) -> RoutingVerdict:
++    """Return the routing verdict for the given signals.
++
++    Any tripwire hit => ``dispatch`` (with reasons). No tripwire hit =>
++    ``inline``. Conservative on unknown: an unknown external/slow dependency,
++    isolation, durability, or verification requirement dispatches (a missed
++    dispatch wastes a little; a missed inline blocks the Director on something
++    it shouldn't). Only *effort* biased differently: unknown effort is assumed
++    small (inline), because most work the Director self-qualifies as "cheap"
++    genuinely is, and the other conservative tripwires already catch the
++    dangerous cases.
++    """
++    reasons: list[str] = []
++
++    if signals.parallel_splits is not None and signals.parallel_splits > DEFAULT_PARALLEL_SPLIT_TRIPWIRE:
++        reasons.append(R_PARALLEL)
++    # Conservative: unknown external dependency dispatches.
++    if signals.external_or_slow_dependency is not False:
++        reasons.append(R_EXTERNAL)
++    # Conservative: unknown verification dispatches. Only an explicit,
++    # positive "no verification needed" allows inline.
++    if signals.needs_verification is True:
++        reasons.append(R_VERIFY)
++    if signals.requires_isolation is True:
++        reasons.append(R_ISOLATION)
++    if signals.needs_durability is True:
++        reasons.append(R_DURABILITY)
++    eff = signals.effort_minutes
++    if eff is not None and eff > DEFAULT_INLINE_EFFORT_MINUTES:
++        reasons.append(R_EFFORT)
++
++    if reasons:
++        return RoutingVerdict(
++            mode="dispatch",
++            reasons=reasons,
++            signals=_signals_to_dict(signals),
++        )
++    return RoutingVerdict(
++        mode="inline",
++        reasons=[T_INLINE_OK],
++        signals=_signals_to_dict(signals),
++    )
++
++
++def _signals_to_dict(signals: RoutingSignals) -> dict:
++    return {
++        "effort_minutes": signals.effort_minutes,
++        "parallel_splits": signals.parallel_splits,
++        "external_or_slow_dependency": signals.external_or_slow_dependency,
++        "needs_verification": signals.needs_verification,
++        "requires_isolation": signals.requires_isolation,
++        "needs_durability": signals.needs_durability,
++    }
+diff --git a/hermes_cli/kanban_swarm.py b/hermes_cli/kanban_swarm.py
+index 4903d91..e26ee3c 100644
+--- a/hermes_cli/kanban_swarm.py
++++ b/hermes_cli/kanban_swarm.py
+@@ -90,6 +90,7 @@ def create_swarm(
+     workspace_path: Optional[str] = None,
+     priority: int = 0,
+     idempotency_key: Optional[str] = None,
++    acceptance: Optional[dict] = None,
+ ) -> SwarmCreated:
+     """Create a durable Kanban swarm graph.
+ 
+@@ -124,6 +125,7 @@ def create_swarm(
+         idempotency_key=idempotency_key,
+         workspace_kind=workspace_kind,
+         workspace_path=workspace_path,
++        acceptance=acceptance,
+     )
+ 
+     # If idempotency returned an existing non-archived root, do not duplicate the
+diff --git a/tests/hermes_cli/test_kanban_ground_truth_inline.py b/tests/hermes_cli/test_kanban_ground_truth_inline.py
+new file mode 100644
+index 0000000..688ef4e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ground_truth_inline.py
+@@ -0,0 +1,245 @@
++"""Ground-truth preservation + cheap-inline routing.
++
++Covers two capabilities added together:
++
++1. Ground-truth preservation across orchestration hops: an ``acceptance``
++   field on a task carries the original intent + machine-checkable criteria
++   forward. A child task that doesn't supply its own acceptance inherits its
++   parent's acceptance VERBATIM (never re-summarized), and ``build_worker_context``
++   renders it as authoritative ground truth the worker must verify.
++2. Cheap-inline routing (``kanban_route.assess_routing``): an explicit,
++   mechanical tripwire deciding whether the Director should run work inline or
++   dispatch it, instead of deciding on vibes.
++"""
++
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_route as kr
++from hermes_cli import kanban_swarm
++
++
++def _fresh_conn(tmp_path, monkeypatch):
++    home = tmp_path / "hermes_home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    conn = kanban_db.connect()
++    return conn
++
++
++# ---------------------------------------------------------------------------
++# Ground-truth preservation
++# ---------------------------------------------------------------------------
++
++def test_acceptance_stored_and_readable(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"intent": "Render blonde crawl-closer", "checks": ["reveal visible", "identity preserved"]}
++        tid = kanban_db.create_task(conn, title="render", acceptance=acc)
++        task = kanban_db.get_task(conn, tid)
++        assert task.acceptance is not None
++        parsed = json.loads(task.acceptance)  # type: ignore[arg-type]
++        assert parsed["intent"] == "Render blonde crawl-closer"
++        assert parsed["checks"] == ["reveal visible", "identity preserved"]
++    finally:
++        conn.close()
++
++
++def test_child_inherits_parent_acceptance_verbatim(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"intent": "original ground truth", "checks": ["a", "b", "c"]}
++        parent = kanban_db.create_task(conn, title="parent", acceptance=acc)
++        child = kanban_db.create_task(conn, title="child", parents=[parent])
++        child_parsed = json.loads(kanban_db.get_task(conn, child).acceptance)  # type: ignore[arg-type]
++        # Ground truth (intent + checks) carried VERBATIM across the hop — this
++        # is the whole point: the worker checks the ORIGINAL criteria, never a
++        # rewritten summary. `source` is provenance metadata (the parent id) and
++        # may differ; intent/checks must not.
++        assert child_parsed["intent"] == "original ground truth"
++        assert child_parsed["checks"] == ["a", "b", "c"]
++        # Provenance recorded so the chain is auditable.
++        assert "source" in child_parsed
++    finally:
++        conn.close()
++
++
++def test_child_with_explicit_acceptance_overrides_inheritance(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        parent = kanban_db.create_task(
++            conn, title="parent", acceptance={"intent": "parent intent", "checks": ["x"]}
++        )
++        own = {"intent": "child intent", "checks": ["y"]}
++        child = kanban_db.create_task(conn, title="child", parents=[parent], acceptance=own)
++        parsed = json.loads(kanban_db.get_task(conn, child).acceptance)  # type: ignore[arg-type]
++        assert parsed["intent"] == "child intent"
++    finally:
++        conn.close()
++
++
++def test_worker_context_renders_ground_truth(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"intent": "verify the reveal", "checks": ["frame shows topless", "no side panels"]}
++        tid = kanban_db.create_task(conn, title="render", acceptance=acc)
++        ctx = kanban_db.build_worker_context(conn, tid)
++        assert "Acceptance criteria (GROUND TRUTH" in ctx
++        assert "verify the reveal" in ctx
++        assert "frame shows topless" in ctx
++        assert "no side panels" in ctx
++    finally:
++        conn.close()
++
++
++def test_no_acceptance_renders_no_block(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        tid = kanban_db.create_task(conn, title="plain")
++        ctx = kanban_db.build_worker_context(conn, tid)
++        assert "Acceptance criteria (GROUND TRUTH" not in ctx
++    finally:
++        conn.close()
++
++
++def test_malformed_acceptance_degrades_to_none(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"checks": ["no intent key"]}
++        tid = kanban_db.create_task(conn, title="bad", acceptance=acc)
++        ctx = kanban_db.build_worker_context(conn, tid)
++        assert "Acceptance criteria (GROUND TRUTH" not in ctx
++        # It still stored (as a dict with no usable intent), but context treats
++        # it as absent rather than crashing.
++    finally:
++        conn.close()
++
++
++# ---------------------------------------------------------------------------
++# Cheap-inline routing
++# ---------------------------------------------------------------------------
++
++def test_route_inline_when_no_tripwire():
++    v = kr.assess_routing(
++        kr.RoutingSignals(
++            effort_minutes=2,
++            parallel_splits=1,
++            external_or_slow_dependency=False,
++            needs_verification=False,
++        )
++    )
++    assert v.mode == "inline"
++    assert kr.T_INLINE_OK in v.reasons
++
++
++def test_route_dispatch_on_parallel_split():
++    v = kr.assess_routing(kr.RoutingSignals(parallel_splits=3))
++    assert v.mode == "dispatch"
++    assert kr.R_PARALLEL in v.reasons
++
++
++def test_route_dispatch_on_external_dependency():
++    v = kr.assess_routing(kr.RoutingSignals(external_or_slow_dependency=True))
++    assert v.mode == "dispatch"
++    assert kr.R_EXTERNAL in v.reasons
++
++
++def test_route_dispatch_on_unknown_external_conservative():
++    # Unknown external dependency (None) must dispatch conservatively.
++    v = kr.assess_routing(kr.RoutingSignals(external_or_slow_dependency=None))
++    assert v.mode == "dispatch"
++    assert kr.R_EXTERNAL in v.reasons
++
++
++def test_route_dispatch_on_verification():
++    v = kr.assess_routing(kr.RoutingSignals(needs_verification=True))
++    assert v.mode == "dispatch"
++    assert kr.R_VERIFY in v.reasons
++
++
++def test_route_dispatch_on_isolation_and_durability():
++    v = kr.assess_routing(
++        kr.RoutingSignals(requires_isolation=True, needs_durability=True)
++    )
++    assert v.mode == "dispatch"
++    assert kr.R_ISOLATION in v.reasons
++    assert kr.R_DURABILITY in v.reasons
++
++
++def test_route_dispatch_on_high_effort():
++    v = kr.assess_routing(kr.RoutingSignals(effort_minutes=60))
++    assert v.mode == "dispatch"
++    assert kr.R_EFFORT in v.reasons
++
++
++def test_route_inline_despite_unknown_effort():
++    # Unknown effort defaults to inline (assumed small); the conservative
++    # tripwires catch the dangerous cases instead.
++    v = kr.assess_routing(kr.RoutingSignals(external_or_slow_dependency=False))
++    assert v.mode == "inline"
++
++
++def test_route_verdict_serializable():
++    v = kr.assess_routing(kr.RoutingSignals(parallel_splits=3))
++    d = v.as_dict()
++    assert d["mode"] == "dispatch"
++    assert kr.R_PARALLEL in d["reasons"]
++    assert "signals" in d
++
++
++# ---------------------------------------------------------------------------
++# Orchestration fan-out (swarm / koor-style) acceptance propagation
++# ---------------------------------------------------------------------------
++
++def _swarm_spec(profile, title):
++    return kanban_swarm.SwarmWorkerSpec(profile=profile, title=title, body=title)
++
++
++def test_swarm_propagates_acceptance_to_every_tier(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"intent": "make the clip match the brief", "checks": ["reveal visible", "single shot"]}
++        created = kanban_swarm.create_swarm(
++            conn,
++            goal="render the clip",
++            workers=[_swarm_spec("media-worker", "render clip")],
++            verifier_assignee="review-worker",
++            synthesizer_assignee="ops-worker",
++            acceptance=acc,
++        )
++        root = kanban_db.get_task(conn, created.root_id)
++        assert json.loads(root.acceptance)["intent"] == "make the clip match the brief"  # type: ignore[arg-type]
++        # Every deployed tier inherits VERBATIM ground truth.
++        for wid in created.worker_ids:
++            w = json.loads(kanban_db.get_task(conn, wid).acceptance)  # type: ignore[arg-type]
++            assert w["intent"] == "make the clip match the brief"
++            assert w["checks"] == ["reveal visible", "single shot"]
++        v = json.loads(kanban_db.get_task(conn, created.verifier_id).acceptance)  # type: ignore[arg-type]
++        assert v["intent"] == "make the clip match the brief"
++        s = json.loads(kanban_db.get_task(conn, created.synthesizer_id).acceptance)  # type: ignore[arg-type]
++        assert s["intent"] == "make the clip match the brief"
++    finally:
++        conn.close()
++
++
++def test_swarm_verifier_context_carries_ground_truth(tmp_path, monkeypatch):
++    conn = _fresh_conn(tmp_path, monkeypatch)
++    try:
++        acc = {"intent": "gate on evidence", "checks": ["evidence sufficient"]}
++        created = kanban_swarm.create_swarm(
++            conn,
++            goal="build feature",
++            workers=[_swarm_spec("dev-worker", "implement")],
++            verifier_assignee="review-worker",
++            synthesizer_assignee="ops-worker",
++            acceptance=acc,
++        )
++        ctx = kanban_db.build_worker_context(conn, created.verifier_id)
++        assert "Acceptance criteria (GROUND TRUTH" in ctx
++        assert "gate on evidence" in ctx
++        assert "evidence sufficient" in ctx
++    finally:
++        conn.close()
++

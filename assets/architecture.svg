@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="780" viewBox="0 0 1400 780" font-family="Inter, Helvetica, Arial, sans-serif">
+  <rect width="1400" height="780" fill="#faf6ee"/>
+
+  <text x="60" y="52" font-size="28" font-weight="700" fill="#6e2439">Ground-Truth Orchestration</text>
+  <text x="62" y="78" font-size="14" fill="#8a5a66">Director → Orchestrator → Workers — intent preserved verbatim, routing made mechanical</text>
+  <line x1="60" y1="94" x2="1340" y2="94" stroke="#cb9b2e" stroke-width="2"/>
+
+  <!-- LAYER 0 -->
+  <rect x="40" y="116" width="1320" height="104" rx="10" fill="#f7f0e2" stroke="#6e2439" stroke-width="1.4"/>
+  <text x="60" y="138" font-size="12" font-weight="700" fill="#6e2439">LAYER 0 · DIRECTOR (intent owner)</text>
+  <rect x="530" y="146" width="340" height="60" rx="8" fill="#6e2439"/>
+  <text x="700" y="176" text-anchor="middle" font-size="17" font-weight="700" fill="#faf6ee">Director</text>
+  <text x="700" y="196" text-anchor="middle" font-size="11" fill="#f1e8d8">long-lived session · keeps your goals</text>
+
+  <line x1="700" y1="220" x2="700" y2="252" stroke="#b5502e" stroke-width="2.4"/>
+  <polygon points="692,250 700,264 708,250" fill="#b5502e"/>
+  <text x="720" y="240" font-size="11" fill="#b5502e">1 · write intent + acceptance criteria</text>
+
+  <!-- Shared board -->
+  <rect x="530" y="268" width="340" height="48" rx="8" fill="#f1e8d8" stroke="#b5502e" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="700" y="290" text-anchor="middle" font-size="14" font-weight="700" fill="#6e2439">Shared board (kanban.db)</text>
+  <text x="700" y="307" text-anchor="middle" font-size="10" fill="#8a5a66">cards + acceptance (durable)</text>
+
+  <line x1="700" y1="316" x2="700" y2="366" stroke="#b5502e" stroke-width="2.4"/>
+  <polygon points="692,364 700,378 708,364" fill="#b5502e"/>
+  <text x="720" y="348" font-size="11" fill="#b5502e">2 · read card / brief</text>
+
+  <!-- LAYER 1 -->
+  <rect x="40" y="382" width="1320" height="100" rx="10" fill="#f7f0e2" stroke="#6e2439" stroke-width="1.4"/>
+  <text x="60" y="404" font-size="12" font-weight="700" fill="#6e2439">LAYER 1 · ORCHESTRATOR (koor)</text>
+  <rect x="380" y="412" width="640" height="56" rx="8" fill="#6e2439"/>
+  <text x="700" y="438" text-anchor="middle" font-size="16" font-weight="700" fill="#faf6ee">Orchestrator (koor)</text>
+  <text x="700" y="458" text-anchor="middle" font-size="10" fill="#f1e8d8">decompose → dispatch → consolidate · conductor, never the heavy lifter</text>
+
+  <text x="60" y="502" font-size="11" fill="#6e2439">3 · spawn children (inherit acceptance verbatim)</text>
+
+  <!-- fan-out arrows from orchestrator bottom (y=468) to each node (y=540) -->
+  <line x1="700" y1="482" x2="520" y2="540" stroke="#6e2439" stroke-width="2"/>
+  <polygon points="512,530 520,544 528,528" fill="#6e2439"/>
+  <line x1="700" y1="482" x2="670" y2="540" stroke="#6e2439" stroke-width="2"/>
+  <polygon points="662,530 670,544 678,528" fill="#6e2439"/>
+  <line x1="700" y1="482" x2="820" y2="540" stroke="#6e2439" stroke-width="2"/>
+  <polygon points="812,530 820,544 828,528" fill="#6e2439"/>
+  <line x1="700" y1="482" x2="970" y2="540" stroke="#6e2439" stroke-width="2"/>
+  <polygon points="962,530 970,544 978,528" fill="#6e2439"/>
+
+  <!-- LAYER 2 -->
+  <rect x="40" y="548" width="1320" height="120" rx="10" fill="#f7f0e2" stroke="#6e2439" stroke-width="1.4"/>
+  <text x="60" y="570" font-size="12" font-weight="700" fill="#6e2439">LAYER 2 · EXECUTION (kanban workers)</text>
+
+  <rect x="420" y="584" width="200" height="66" rx="8" fill="#b5502e"/>
+  <text x="520" y="612" text-anchor="middle" font-size="14" font-weight="700" fill="#faf6ee">Worker · dev</text>
+  <rect x="660" y="584" width="200" height="66" rx="8" fill="#b5502e"/>
+  <text x="760" y="612" text-anchor="middle" font-size="14" font-weight="700" fill="#faf6ee">Worker · media</text>
+  <rect x="900" y="584" width="200" height="66" rx="8" fill="#b5502e"/>
+  <text x="1000" y="612" text-anchor="middle" font-size="14" font-weight="700" fill="#faf6ee">Worker · ops</text>
+  <rect x="1140" y="584" width="200" height="66" rx="8" fill="#cb9b2e"/>
+  <text x="1240" y="612" text-anchor="middle" font-size="14" font-weight="700" fill="#34101b">Verifier · review</text>
+
+  <!-- return path: from verifier top (1240,584) up to orchestrator right side, routed in the free column x=1290 -->
+  <path d="M 1240 584 L 1290 584 L 1290 440 L 1020 440" fill="none" stroke="#cb9b2e" stroke-width="1.8" stroke-dasharray="6 4"/>
+  <polygon points="1012,432 1020,440 1012,448" fill="#cb9b2e"/>
+  <text x="1302" y="512" font-size="11" fill="#b5502e">4 · pass/fail vs</text>
+  <text x="1302" y="526" font-size="11" fill="#b5502e">acceptance</text>
+
+  <rect x="40" y="740" width="1320" height="28" rx="6" fill="#6e2439"/>
+  <text x="60" y="758" font-size="11" fill="#faf6ee">LEGEND · burgundy = control  · rust = execution  · gold = review/pass-fail  · dashed = durable board or feedback</text>
+</svg>
